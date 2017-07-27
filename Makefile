@@ -2,7 +2,7 @@
 
 PROJECT = cowboy
 PROJECT_DESCRIPTION = Small, fast, modern HTTP server.
-PROJECT_VERSION = 2.0.0-pre.9
+PROJECT_VERSION = 2.0.0-rc.1
 PROJECT_REGISTERED = cowboy_clock
 
 # Options.
@@ -11,16 +11,16 @@ COMPILE_FIRST = cowboy_middleware cowboy_stream cowboy_sub_protocol
 PLT_APPS = public_key ssl
 CT_OPTS += -ct_hooks cowboy_ct_hook [] # -boot start_sasl
 
-CI_OTP ?= OTP-19.0.7 OTP-19.1.6 OTP-19.2.3 OTP-19.3.3 OTP-20.0-rc1
+CI_OTP ?= OTP-19.0.7 OTP-19.1.6 OTP-19.2.3 OTP-19.3.6.1 OTP-20.0.1
 CI_HIPE ?= $(lastword $(CI_OTP))
-CI_ERLLVM ?= $(CI_HIPE)
+# CI_ERLLVM ?= $(CI_HIPE)
 
 # Dependencies.
 
 LOCAL_DEPS = crypto
 
 DEPS = cowlib ranch
-dep_cowlib = git https://github.com/ninenines/cowlib master
+dep_cowlib = git https://github.com/ninenines/cowlib 2.0.0-rc.1
 dep_ranch = git https://github.com/ninenines/ranch 1.4.0
 
 DOC_DEPS = asciideck
