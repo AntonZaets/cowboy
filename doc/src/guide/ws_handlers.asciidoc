@@ -57,18 +57,19 @@ be:
 
 [source,erlang]
 ----
-init(Req, State) ->
-    case cowboy_req:parse_header(<<"sec-websocket-protocol">>, Req) of
+init(Req0, State) ->
+    case cowboy_req:parse_header(<<"sec-websocket-protocol">>, Req0) of
         undefined ->
-            {cowboy_websocket, Req, State};
+            {cowboy_websocket, Req0, State};
         Subprotocols ->
             case lists:keymember(<<"mqtt">>, 1, Subprotocols) of
                 true ->
-                    Req2 = cowboy_req:set_resp_header(<<"sec-websocket-protocol">>,
-                        <<"mqtt">>, Req),
-                    {cowboy_websocket, Req2, State};
+                    Req = cowboy_req:set_resp_header(<<"sec-websocket-protocol">>,
+                        <<"mqtt">>, Req0),
+                    {cowboy_websocket, Req, State};
                 false ->
-                    {stop, Req, State}
+                    Req = cowboy_req:reply(400, Req0),
+                    {ok, Req, State}
             end
     end.
 ----
@@ -151,7 +152,9 @@ websocket_info(_Info, State) ->
 
 === Sending frames
 
-// @todo So yeah, reply makes no sense. Maybe change it to send. Sigh.
+// @todo This will be deprecated and eventually replaced with a
+// {Commands, State} interface that allows providing more
+// functionality easily.
 
 All `websocket_` callbacks share return values. They may
 send zero, one or many frames to the client.
@@ -221,8 +224,6 @@ init(Req, State) ->
 
 This value cannot be changed once it is set. It defaults to
 `60000`.
-
-// @todo Perhaps the default should be changed.
 
 === Saving memory
 
