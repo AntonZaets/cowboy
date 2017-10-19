@@ -56,6 +56,7 @@ init_dispatch(Config) ->
 		{"/opts/:key/timeout", echo_h, #{timeout => 1000, crash => true}},
 		{"/full/:key", echo_h, []},
 		{"/no/:key", echo_h, []},
+		{"/direct/:key/[...]", echo_h, []},
 		{"/:key/[...]", echo_h, []}
 	]}]).
 
@@ -82,9 +83,23 @@ do_body(Method, Path, Headers0, Body, Config) ->
 	gun:close(ConnPid),
 	do_decode(RespHeaders, RespBody).
 
-do_get(Path, Config) ->
+do_body_error(Method, Path, Headers0, Body, Config) ->
 	ConnPid = gun_open(Config),
-	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	Headers = [{<<"accept-encoding">>, <<"gzip">>}|Headers0],
+	Ref = case Body of
+		<<>> -> gun:request(ConnPid, Method, Path, Headers);
+		_ -> gun:request(ConnPid, Method, Path, Headers, Body)
+	end,
+	{response, _, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	gun:close(ConnPid),
+	{Status, RespHeaders}.
+
+do_get(Path, Config) ->
+	do_get(Path, [], Config).
+
+do_get(Path, Headers, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}|Headers]),
 	{response, IsFin, Status, RespHeaders} = gun:await(ConnPid, Ref),
 	{ok, RespBody} = case IsFin of
 		nofin -> gun:await_body(ConnPid, Ref);
@@ -128,14 +143,19 @@ header(Config) ->
 
 headers(Config) ->
 	doc("Request headers."),
+	do_headers("/headers", Config),
+	do_headers("/direct/headers", Config).
+
+do_headers(Path, Config) ->
 	%% We always send accept-encoding with this test suite's requests.
 	<<"#{<<\"accept-encoding\">> => <<\"gzip\">>,<<\"header\">> => <<\"value\">>", _/bits>>
-		= do_get_body("/headers", [{<<"header">>, "value"}], Config),
+		= do_get_body(Path, [{<<"header">>, "value"}], Config),
 	ok.
 
 host(Config) ->
 	doc("Request URI host."),
 	<<"localhost">> = do_get_body("/host", Config),
+	<<"localhost">> = do_get_body("/direct/host", Config),
 	ok.
 
 host_info(Config) ->
@@ -151,6 +171,9 @@ match_cookies(Config) ->
 	<<"#{c => <<\"d\">>}">> = do_get_body("/match/cookies/c", [{<<"cookie">>, "a=b; c=d"}], Config),
 	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/cookies/a/c",
 		[{<<"cookie">>, "a=b; c=d"}], Config),
+	%% Ensure match errors result in a 400 response.
+	{400, _, _} = do_get("/match/cookies/a/c",
+		[{<<"cookie">>, "a=b"}], Config),
 	%% This function is tested more extensively through unit tests.
 	ok.
 
@@ -163,18 +186,24 @@ match_qs(Config) ->
 	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a=b&c=d", Config),
 	<<"#{a => <<\"b\">>,c => true}">> = do_get_body("/match/qs/a/c?a=b&c", Config),
 	<<"#{a => true,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a&c=d", Config),
+	%% Ensure match errors result in a 400 response.
+	{400, _, _} = do_get("/match/qs/a/c?a=b", [], Config),
 	%% This function is tested more extensively through unit tests.
 	ok.
 
 method(Config) ->
 	doc("Request method."),
-	<<"GET">> = do_body("GET", "/method", Config),
-	<<>> = do_body("HEAD", "/method", Config),
-	<<"OPTIONS">> = do_body("OPTIONS", "/method", Config),
-	<<"PATCH">> = do_body("PATCH", "/method", Config),
-	<<"POST">> = do_body("POST", "/method", Config),
-	<<"PUT">> = do_body("PUT", "/method", Config),
-	<<"ZZZZZZZZ">> = do_body("ZZZZZZZZ", "/method", Config),
+	do_method("/method", Config),
+	do_method("/direct/method", Config).
+
+do_method(Path, Config) ->
+	<<"GET">> = do_body("GET", Path, Config),
+	<<>> = do_body("HEAD", Path, Config),
+	<<"OPTIONS">> = do_body("OPTIONS", Path, Config),
+	<<"PATCH">> = do_body("PATCH", Path, Config),
+	<<"POST">> = do_body("POST", Path, Config),
+	<<"PUT">> = do_body("PUT", Path, Config),
+	<<"ZZZZZZZZ">> = do_body("ZZZZZZZZ", Path, Config),
 	ok.
 
 parse_cookies(Config) ->
@@ -187,6 +216,11 @@ parse_cookies(Config) ->
 	<<"[{<<\"cake\">>,<<\"strawberry\">>},{<<\"color\">>,<<\"blue\">>}]">>
 		= do_get_body("/parse_cookies",
 			[{<<"cookie">>, "cake=strawberry"}, {<<"cookie">>, "color=blue"}], Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/parse_cookies",
+		[{<<"cookie">>, "bad name=strawberry"}], Config),
+	{400, _, _} = do_get("/parse_cookies",
+		[{<<"cookie">>, "goodname=strawberry\tmilkshake"}], Config),
 	ok.
 
 parse_header(Config) ->
@@ -201,6 +235,9 @@ parse_header(Config) ->
 	<<"undefined">> = do_get_body("/args/parse_header/upgrade", Config),
 	%% Header in request and with default provided.
 	<<"100-continue">> = do_get_body("/args/parse_header/expect/100-continue", Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/args/parse_header/accept",
+		[{<<"accept">>, "bad media type"}], Config),
 	ok.
 
 parse_qs(Config) ->
@@ -208,14 +245,21 @@ parse_qs(Config) ->
 	<<"[]">> = do_get_body("/parse_qs", Config),
 	<<"[{<<\"abc\">>,true}]">> = do_get_body("/parse_qs?abc", Config),
 	<<"[{<<\"a\">>,<<\"b\">>},{<<\"c\">>,<<\"d e\">>}]">> = do_get_body("/parse_qs?a=b&c=d+e", Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/parse_qs?%%%%%%%", Config),
 	ok.
 
 path(Config) ->
 	doc("Request URI path."),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource?query", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource?query#fragment", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource#fragment", Config),
+	do_path("/path", Config),
+	do_path("/direct/path", Config).
+
+do_path(Path0, Config) ->
+	Path = list_to_binary(Path0 ++ "/to/the/resource"),
+	Path = do_get_body(Path, Config),
+	Path = do_get_body([Path, "?query"], Config),
+	Path = do_get_body([Path, "?query#fragment"], Config),
+	Path = do_get_body([Path, "#fragment"], Config),
 	ok.
 
 path_info(Config) ->
@@ -232,25 +276,35 @@ path_info(Config) ->
 peer(Config) ->
 	doc("Request peer."),
 	<<"{{127,0,0,1},", _/bits >> = do_get_body("/peer", Config),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/direct/peer", Config),
 	ok.
 
 port(Config) ->
 	doc("Request URI port."),
 	Port = integer_to_binary(config(port, Config)),
 	Port = do_get_body("/port", Config),
+	Port = do_get_body("/direct/port", Config),
 	ok.
 
 qs(Config) ->
 	doc("Request URI query string."),
-	<<>> = do_get_body("/qs", Config),
-	<<"abc">> = do_get_body("/qs?abc", Config),
-	<<"a=b&c=d+e">> = do_get_body("/qs?a=b&c=d+e", Config),
+	do_qs("/qs", Config),
+	do_qs("/direct/qs", Config).
+
+do_qs(Path, Config) ->
+	<<>> = do_get_body(Path, Config),
+	<<"abc">> = do_get_body(Path ++ "?abc", Config),
+	<<"a=b&c=d+e">> = do_get_body(Path ++ "?a=b&c=d+e", Config),
 	ok.
 
 scheme(Config) ->
 	doc("Request URI scheme."),
+	do_scheme("/scheme", Config),
+	do_scheme("/direct/scheme", Config).
+
+do_scheme(Path, Config) ->
 	Transport = config(type, Config),
-	case do_get_body("/scheme", Config) of
+	case do_get_body(Path, Config) of
 		<<"http">> when Transport =:= tcp -> ok;
 		<<"https">> when Transport =:= ssl -> ok
 	end.
@@ -286,8 +340,12 @@ uri(Config) ->
 
 version(Config) ->
 	doc("Request HTTP version."),
+	do_version("/version", Config),
+	do_version("/direct/version", Config).
+
+do_version(Path, Config) ->
 	Protocol = config(protocol, Config),
-	case do_get_body("/version", Config) of
+	case do_get_body(Path, Config) of
 		<<"HTTP/1.1">> when Protocol =:= http -> ok;
 		<<"HTTP/2">> when Protocol =:= http2 -> ok
 	end.
@@ -360,6 +418,8 @@ read_urlencoded_body(Config) ->
 	ok = do_read_urlencoded_body_too_long("/crash/read_urlencoded_body/period", <<"abc">>, Config),
 	%% The timeout value is set too low on purpose to ensure a crash occurs.
 	ok = do_read_body_timeout("/opts/read_urlencoded_body/timeout", <<"abc">>, Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/read_urlencoded_body", [], "%%%%%", Config),
 	ok.
 
 %% We expect a crash.
@@ -369,7 +429,7 @@ do_read_urlencoded_body_too_large(Path, Body, Config) ->
 		{<<"content-length">>, integer_to_binary(iolist_size(Body))}
 	]),
 	gun:data(ConnPid, Ref, fin, Body),
-	{response, _, 500, _} = gun:await(ConnPid, Ref),
+	{response, _, 413, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
 
 %% We expect a crash.
@@ -381,7 +441,14 @@ do_read_urlencoded_body_too_long(Path, Body, Config) ->
 	gun:data(ConnPid, Ref, nofin, Body),
 	timer:sleep(1100),
 	gun:data(ConnPid, Ref, fin, Body),
-	{response, _, 500, _} = gun:await(ConnPid, Ref),
+	{response, _, 408, RespHeaders} = gun:await(ConnPid, Ref),
+	_ = case config(protocol, Config) of
+		http ->
+			%% 408 error responses should close HTTP/1.1 connections.
+			{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, RespHeaders);
+		http2 ->
+			ok
+	end,
 	gun:close(ConnPid).
 
 multipart(Config) ->
@@ -406,6 +473,64 @@ do_multipart(Path, Config) ->
 		<<"content-type">> := <<"application/octet-stream">>,
 		<<"x-custom">> := <<"value">>
 	} = LargeHeaders,
+	ok.
+
+multipart_error_empty(Config) ->
+	doc("Multipart request body is empty."),
+	%% We use an empty list as a body to make sure Gun knows
+	%% we want to send an empty body.
+	%% @todo This is a terrible hack. Improve Gun!
+	Body = [],
+	%% Ensure an empty body results in a 400 error.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], Body, Config),
+	ok.
+
+multipart_error_preamble_only(Config) ->
+	doc("Multipart request body only contains a preamble."),
+	%% Ensure an empty body results in a 400 error.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], <<"Preamble.">>, Config),
+	ok.
+
+multipart_error_headers(Config) ->
+	doc("Multipart request body with invalid part headers."),
+	ReqBody = [
+		"--deadbeef\r\nbad-header text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+		"--deadbeef--"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], ReqBody, Config),
+	ok.
+
+%% The function to parse the multipart body currently does not crash,
+%% as far as I can tell. There is therefore no test for it.
+
+multipart_error_no_final_boundary(Config) ->
+	doc("Multipart request body with no final boundary."),
+	ReqBody = [
+		"--deadbeef\r\nContent-Type: text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], ReqBody, Config),
+	ok.
+
+multipart_missing_boundary(Config) ->
+	doc("Multipart request body without a boundary in the media type."),
+	ReqBody = [
+		"--deadbeef\r\nContent-Type: text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+		"--deadbeef--"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed">>}
+	], ReqBody, Config),
 	ok.
 
 read_part_skip_body(Config) ->
@@ -507,6 +632,27 @@ set_resp_body(Config) ->
 	{200, _, <<"OVERRIDE">>} = do_get("/resp/set_resp_body/override", Config),
 	{ok, AppFile} = file:read_file(code:where_is_file("cowboy.app")),
 	{200, _, AppFile} = do_get("/resp/set_resp_body/sendfile", Config),
+	ok.
+
+set_resp_body_sendfile0(Config) ->
+	doc("Response using set_resp_body with a sendfile of length 0."),
+	Path = "/resp/set_resp_body/sendfile0",
+	ConnPid = gun_open(Config),
+	%% First request.
+	Ref1 = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	{response, IsFin, 200, _} = gun:await(ConnPid, Ref1),
+	{ok, <<>>} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref1);
+		fin -> {ok, <<>>}
+	end,
+	%% Second request will confirm everything works as intended.
+	Ref2 = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	{response, IsFin, 200, _} = gun:await(ConnPid, Ref2),
+	{ok, <<>>} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref2);
+		fin -> {ok, <<>>}
+	end,
+	gun:close(ConnPid),
 	ok.
 
 has_resp_header(Config) ->

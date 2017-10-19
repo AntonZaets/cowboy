@@ -98,7 +98,7 @@
 %% Cowboy expects the real length as it is used as metadata.
 %% @todo We should probably explicitly reject it.
 -type resp_body() :: iodata()
-	| {sendfile, non_neg_integer(), pos_integer(), file:name_all()}.
+	| {sendfile, non_neg_integer(), non_neg_integer(), file:name_all()}.
 -export_type([resp_body/0]).
 
 -type push_opts() :: #{
@@ -184,11 +184,23 @@ qs(#{qs := Qs}) ->
 %% @todo Might be useful to limit the number of keys.
 -spec parse_qs(req()) -> [{binary(), binary() | true}].
 parse_qs(#{qs := Qs}) ->
-	cow_qs:parse_qs(Qs).
+	try
+		cow_qs:parse_qs(Qs)
+	catch _:_ ->
+		erlang:raise(exit, {request_error, qs,
+			'Malformed query string; application/x-www-form-urlencoded expected.'
+		}, erlang:get_stacktrace())
+	end.
 
 -spec match_qs(cowboy:fields(), req()) -> map().
 match_qs(Fields, Req) ->
-	filter(Fields, kvlist_to_map(Fields, parse_qs(Req))).
+	case filter(Fields, kvlist_to_map(Fields, parse_qs(Req))) of
+		{ok, Map} ->
+			Map;
+		{error, Errors} ->
+			exit({request_error, {match_qs, Errors},
+				'Query string validation constraints failed for the reasons provided.'})
+	end.
 
 -spec uri(req()) -> iodata().
 uri(Req) ->
@@ -353,18 +365,21 @@ headers(#{headers := Headers}) ->
 
 -spec parse_header(binary(), Req) -> any() when Req::req().
 parse_header(Name = <<"content-length">>, Req) ->
-	parse_header(Name, Req, 0, fun cow_http_hd:parse_content_length/1);
+	parse_header(Name, Req, 0);
 parse_header(Name = <<"cookie">>, Req) ->
-	parse_header(Name, Req, [], fun cow_cookie:parse_cookie/1);
-%% @todo That header is abstracted out and should never reach cowboy_req.
-parse_header(Name = <<"transfer-encoding">>, Req) ->
-	parse_header(Name, Req, [<<"identity">>], fun cow_http_hd:parse_transfer_encoding/1);
+	parse_header(Name, Req, []);
 parse_header(Name, Req) ->
 	parse_header(Name, Req, undefined).
 
 -spec parse_header(binary(), Req, any()) -> any() when Req::req().
 parse_header(Name, Req, Default) ->
-	parse_header(Name, Req, Default, parse_header_fun(Name)).
+	try
+		parse_header(Name, Req, Default, parse_header_fun(Name))
+	catch _:_ ->
+		erlang:raise(exit, {request_error, {header, Name},
+			'Malformed header. Please consult the relevant specification.'
+		}, erlang:get_stacktrace())
+	end.
 
 parse_header_fun(<<"accept">>) -> fun cow_http_hd:parse_accept/1;
 parse_header_fun(<<"accept-charset">>) -> fun cow_http_hd:parse_accept_charset/1;
@@ -383,7 +398,6 @@ parse_header_fun(<<"if-unmodified-since">>) -> fun cow_http_hd:parse_if_unmodifi
 parse_header_fun(<<"range">>) -> fun cow_http_hd:parse_range/1;
 parse_header_fun(<<"sec-websocket-extensions">>) -> fun cow_http_hd:parse_sec_websocket_extensions/1;
 parse_header_fun(<<"sec-websocket-protocol">>) -> fun cow_http_hd:parse_sec_websocket_protocol_req/1;
-parse_header_fun(<<"transfer-encoding">>) -> fun cow_http_hd:parse_transfer_encoding/1;
 parse_header_fun(<<"upgrade">>) -> fun cow_http_hd:parse_upgrade/1;
 parse_header_fun(<<"x-forwarded-for">>) -> fun cow_http_hd:parse_x_forwarded_for/1.
 
@@ -399,7 +413,13 @@ parse_cookies(Req) ->
 
 -spec match_cookies(cowboy:fields(), req()) -> map().
 match_cookies(Fields, Req) ->
-	filter(Fields, kvlist_to_map(Fields, parse_cookies(Req))).
+	case filter(Fields, kvlist_to_map(Fields, parse_cookies(Req))) of
+		{ok, Map} ->
+			Map;
+		{error, Errors} ->
+			exit({request_error, {match_cookies, Errors},
+				'Cookie validation constraints failed for the reasons provided.'})
+	end.
 
 %% Request body.
 
@@ -432,7 +452,7 @@ read_body(Req=#{pid := Pid, streamid := StreamID}, Opts) ->
 	receive
 		{request_body, Ref, nofin, Body} ->
 			{more, Body, Req};
-		{request_body, Ref, {fin, BodyLength}, Body} ->
+		{request_body, Ref, fin, BodyLength, Body} ->
 			{ok, Body, set_body_length(Req, BodyLength)}
 	after Timeout ->
 		exit(timeout)
@@ -451,8 +471,26 @@ read_urlencoded_body(Req) ->
 
 -spec read_urlencoded_body(Req, read_body_opts()) -> {ok, [{binary(), binary() | true}], Req} when Req::req().
 read_urlencoded_body(Req0, Opts) ->
-	{ok, Body, Req} = read_body(Req0, Opts),
-	{ok, cow_qs:parse_qs(Body), Req}.
+	case read_body(Req0, Opts) of
+		{ok, Body, Req} ->
+			try
+				{ok, cow_qs:parse_qs(Body), Req}
+			catch _:_ ->
+				erlang:raise(exit, {request_error, urlencoded_body,
+					'Malformed body; application/x-www-form-urlencoded expected.'
+				}, erlang:get_stacktrace())
+			end;
+		{more, Body, _} ->
+			Length = maps:get(length, Opts, 64000),
+			if
+				byte_size(Body) < Length ->
+					exit({request_error, timeout,
+						'The request body was not received within the configured time.'});
+				true ->
+					exit({request_error, payload_too_large,
+						'The request body is larger than allowed by configuration.'})
+			end
+	end.
 
 %% Multipart.
 
@@ -468,19 +506,19 @@ read_part(Req) ->
 read_part(Req, Opts) ->
 	case maps:is_key(multipart, Req) of
 		true ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(Data, Opts, Req2);
 		false ->
 			read_part(init_multipart(Req), Opts)
 	end.
 
 read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
-	case cow_multipart:parse_headers(Buffer, Boundary) of
+	try cow_multipart:parse_headers(Buffer, Boundary) of
 		more ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(<< Buffer/binary, Data/binary >>, Opts, Req2);
 		{more, Buffer2} ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, headers),
 			read_part(<< Buffer2/binary, Data/binary >>, Opts, Req2);
 		{ok, Headers0, Rest} ->
 			Headers = maps:from_list(Headers0),
@@ -490,6 +528,10 @@ read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
 		%% Ignore epilogue.
 		{done, _} ->
 			{done, Req#{multipart => done}}
+	catch _:_ ->
+		erlang:raise(exit, {request_error, {multipart, headers},
+			'Malformed body; multipart expected.'
+		}, erlang:get_stacktrace())
 	end.
 
 -spec read_part_body(Req)
@@ -515,7 +557,7 @@ read_part_body(Buffer, Opts, Req=#{multipart := {Boundary, _}}, Acc) ->
 		true ->
 			{more, Acc, Req#{multipart => {Boundary, Buffer}}};
 		false ->
-			{Data, Req2} = stream_multipart(Req, Opts),
+			{Data, Req2} = stream_multipart(Req, Opts, body),
 			case cow_multipart:parse_body(<< Buffer/binary, Data/binary >>, Boundary) of
 				{ok, Body} ->
 					read_part_body(<<>>, Opts, Req2, << Acc/binary, Body/binary >>);
@@ -533,15 +575,28 @@ read_part_body(Buffer, Opts, Req=#{multipart := {Boundary, _}}, Acc) ->
 
 init_multipart(Req) ->
 	{<<"multipart">>, _, Params} = parse_header(<<"content-type">>, Req),
-	{_, Boundary} = lists:keyfind(<<"boundary">>, 1, Params),
-	Req#{multipart => {Boundary, <<>>}}.
+	case lists:keyfind(<<"boundary">>, 1, Params) of
+		{_, Boundary} ->
+			Req#{multipart => {Boundary, <<>>}};
+		false ->
+			exit({request_error, {multipart, boundary},
+				'Missing boundary parameter for multipart media type.'})
+	end.
 
-stream_multipart(Req=#{multipart := done}, _) ->
+stream_multipart(Req=#{multipart := done}, _, _) ->
 	{<<>>, Req};
-stream_multipart(Req=#{multipart := {_, <<>>}}, Opts) ->
-	{_, Data, Req2} = read_body(Req, Opts),
-	{Data, Req2};
-stream_multipart(Req=#{multipart := {Boundary, Buffer}}, _) ->
+stream_multipart(Req=#{multipart := {_, <<>>}}, Opts, Type) ->
+	case read_body(Req, Opts) of
+		{more, Data, Req2} ->
+			{Data, Req2};
+		%% We crash when the data ends unexpectedly.
+		{ok, <<>>, _} ->
+			exit({request_error, {multipart, Type},
+				'Malformed body; multipart expected.'});
+		{ok, Data, Req2} ->
+			{Data, Req2}
+	end;
+stream_multipart(Req=#{multipart := {Boundary, Buffer}}, _, _) ->
 	{Buffer, Req#{multipart => {Boundary, <<>>}}}.
 
 %% Response.
@@ -635,6 +690,11 @@ reply(Status, Headers, Req) ->
 	-> Req when Req::req().
 reply(_, _, _, #{has_sent_resp := _}) ->
 	error(function_clause);
+reply(Status, Headers, {sendfile, _, 0, _}, Req)
+		when is_integer(Status); is_binary(Status) ->
+	do_reply(Status, Headers#{
+		<<"content-length">> => <<"0">>
+	}, <<>>, Req);
 reply(Status, Headers, SendFile = {sendfile, _, Len, _}, Req)
 		when is_integer(Status); is_binary(Status) ->
 	do_reply(Status, Headers#{
@@ -763,12 +823,7 @@ kvlist_to_map(Keys, [{Key, Value}|Tail], Map) ->
 	end.
 
 filter(Fields, Map0) ->
-	case filter(Fields, Map0, #{}) of
-		{ok, Map} ->
-			Map;
-		{error, Errors} ->
-			exit({validation_failed, Errors})
-	end.
+	filter(Fields, Map0, #{}).
 
 %% Loop through fields, if value is missing and no default,
 %% record the error; else if value is missing and has a
