@@ -101,6 +101,12 @@ info(StreamID, Exit = {'EXIT', Pid, {Reason, Stacktrace}}, State=#state{ref=Ref,
 		{error_response, 500, #{<<"content-length">> => <<"0">>}, <<>>},
 		{internal_error, Exit, 'Stream process crashed.'}
 	], State};
+info(StreamID, Exit = {'EXIT', Pid, Reason}, State=#state{ref=Ref, pid=Pid}) ->
+	report_crash(Ref, StreamID, Pid, Reason, []),
+	{[
+		{error_response, 500, #{<<"content-length">> => <<"0">>}, <<>>},
+		{internal_error, Exit, 'Stream process crashed.'}
+	], State};
 %% Request body, body buffered large enough or complete.
 info(_StreamID, {read_body, Ref, Length, _}, State=#state{pid=Pid,
 		read_body_is_fin=IsFin, read_body_buffer=Buffer, body_length=BodyLen})
